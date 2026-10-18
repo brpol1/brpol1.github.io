@@ -9,15 +9,16 @@
     { name: 'vidi',      title: 'Kinogo · Плеер 3' }
   ];
   var KINOGO = 'https://kinogo.luxury';
-  var ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2bd49a"/><path d="M25 18l24 14-24 14z" fill="#071510"/></svg>';
+  var NEXTEMBED = 'https://api.nextembed.ws';
 
   function startPlugin() {
     Lampa.Lang.add({
       kinogo_title: { ru: 'Kinogo', en: 'Kinogo' },
       kinogo_desc:  { ru: 'Фильмы и сериалы с kinogo.luxury', en: 'Movies from kinogo.luxury' },
       kinogo_nolink:{ ru: 'Kinogo: не удалось получить видео', en: 'Kinogo: no video' },
-      kinogo_switch:{ ru: 'Kinogo: открываю Плеер 1', en: 'Kinogo: fallback' },
-      kinogo_search:{ ru: 'Kinogo: ищу страницу фильма…', en: 'Kinogo: searching…' }
+      kinogo_noid:  { ru: 'Kinogo: у фильма нет ID Кинопоиска в TMDB — в web-версии Плеер 1 недоступен. Откройте в приложении Android/ТВ или выберите другой источник.', en: 'Kinogo: no Kinopoisk ID for this title' },
+      kinogo_retry: { ru: 'Повторить', en: 'Retry' },
+      kinogo_change:{ ru: 'Сменить источник', en: 'Change source' }
     });
 
     Lampa.Template.add('kinogo_css',
@@ -35,8 +36,11 @@
       ".kinogo-frame-btn.focus{background:#fff;color:#000}" +
       ".kinogo-frame-box{position:absolute;top:3.4em;left:0;right:0;bottom:0}" +
       ".kinogo-frame{width:100%;height:100%;border:0}" +
-      ".kinogo-empty{padding:2em;font-size:1.3em;opacity:.85}" +
-      ".kinogo-diag{margin-top:1em;font-size:.75em;opacity:.6;line-height:1.5;word-break:break-all}" +
+      ".kinogo-empty{padding:2em;font-size:1.3em;opacity:.9}" +
+      ".kinogo-empty__buttons{display:flex;margin-top:1.2em}" +
+      ".kinogo-empty__button{background:rgba(0,0,0,.4);font-size:1em;padding:.6em 1.4em;border-radius:.4em;margin-right:1em}" +
+      ".kinogo-empty__button.focus{background:#fff;color:#000}" +
+      ".kinogo-diag{margin-top:1.4em;font-size:.7em;opacity:.55;line-height:1.6;word-break:break-all}" +
       "</style>");
     $('body').append(Lampa.Template.get('kinogo_css', {}, true));
 
@@ -55,7 +59,7 @@
       var scroll = new Lampa.Scroll({ mask: true, over: true });
       var files  = new Lampa.Explorer(object);
       var filter = new Lampa.Filter(object);
-      var providers = {}, config = null, filterData = {}, kpId = '';
+      var providers = {}, config = null, filterData = {}, kpId = null;
       var balanser = Lampa.Storage.get('kinogo_balanser', 'nextembed');
       var choice = getChoice();
       var diag = [];
@@ -76,39 +80,36 @@
         Lampa.Storage.set('kinogo_choice', all);
       }
 
-      // сеть: напрямую → 2 прокси (без мёртвого corsproxy)
+      // один прямой запрос, без мёртвых прокси
       function getText(url, ok, fail) {
-        var chain = [url,
-          'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
-          'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url)];
-        function step(i) {
-          if (destroyed) return;
-          if (i >= chain.length) { log('fetch', 'FAIL ' + url.slice(0, 60)); if (fail) fail(); return; }
-          var net = new Lampa.Reguest();
-          net.timeout(9000);
-          net['native'](chain[i], function (str) {
-            if (str && String(str).length > 100) { if (i > 0) log('fetch', 'OK via proxy' + i); ok(String(str)); }
-            else step(i + 1);
-          }, function (er) { log('fetch', 'err ' + i + ' ' + ((er && er.status) || '')); step(i + 1); }, false, { dataType: 'text' });
-        }
-        step(0);
+        if (destroyed) return;
+        var net = new Lampa.Reguest();
+        net.timeout(10000);
+        net['native'](url, function (str) {
+          if (str && String(str).length > 100) ok(String(str));
+          else { log('fetch', 'empty ' + url.slice(0, 50)); if (fail) fail(); }
+        }, function (er) {
+          log('fetch', 'err ' + ((er && er.status) || 0) + ' ' + url.slice(0, 50));
+          if (fail) fail();
+        }, false, { dataType: 'text' });
       }
 
       function getKpId(cb) {
-        if (object.movie.kinopoisk_id) { log('kp_id', 'card: ' + object.movie.kinopoisk_id); return cb(String(object.movie.kinopoisk_id)); }
+        if (kpId !== null) return cb(kpId);
+        if (object.movie.kinopoisk_id) { kpId = String(object.movie.kinopoisk_id); log('kp_id', 'card ' + kpId); return cb(kpId); }
         try {
           if (Lampa.Api && Lampa.Api.sources && Lampa.Api.sources.tmdb) {
             var type = object.movie.name ? 'tv' : 'movie';
             var id = (['cub', 'tmdb'].indexOf(object.movie.source || 'tmdb') == -1) ? object.movie.tmdb_id : object.movie.id;
             Lampa.Api.sources.tmdb.get(type + '/' + id + '/external_ids', {}, function (json) {
-              log('kp_id', json && json.kinopoisk_id ? json.kinopoisk_id : 'none');
-              cb(json && json.kinopoisk_id ? String(json.kinopoisk_id) : '');
-            }, function () { log('kp_id', 'tmdb fail'); cb(''); });
+              kpId = json && json.kinopoisk_id ? String(json.kinopoisk_id) : '';
+              log('kp_id', kpId || 'none');
+              cb(kpId);
+            }, function () { kpId = ''; log('kp_id', 'tmdb fail'); cb(''); });
             return;
           }
         } catch (e) {}
-        log('kp_id', 'no api');
-        cb('');
+        kpId = ''; cb('');
       }
 
       function loadProviders(cb) {
@@ -150,12 +151,31 @@
         else { this.activity.loader(false); this.activity.toggle(); }
       };
       this.reset = function () { scroll.clear(); };
+
       this.empty = function (msg) {
         this.loading(false);
         scroll.clear();
-        scroll.append($('<div class="kinogo-empty">' + msg + '<div class="kinogo-diag">' + diag.join('<br>') + '</div></div>'));
+        var box = $('<div class="kinogo-empty">' + msg +
+          '<div class="kinogo-empty__buttons"></div>' +
+          '<div class="kinogo-diag">' + diag.join('<br>') + '</div></div>');
+        var retry = $('<div class="kinogo-empty__button selector">' + Lampa.Lang.translate('kinogo_retry') + '</div>');
+        retry.on('hover:enter', function () { Lampa.Activity.replace(); });
+        var change = $('<div class="kinogo-empty__button selector">' + Lampa.Lang.translate('kinogo_change') + '</div>');
+        change.on('hover:enter', function () {
+          filter.render().find('.filter--sort').trigger('hover:enter');
+        });
+        box.find('.kinogo-empty__buttons').append(retry).append(change);
+        scroll.append(box);
         Lampa.Controller.enable('content');
       };
+
+      function setSortMenu() {
+        filter.set('sort', BALANSERS.map(function (b) {
+          return { title: b.title, source: b.name, selected: b.name == balanser };
+        }));
+        var cur = BALANSERS.filter(function (b) { return b.name == balanser; })[0];
+        filter.chosen('sort', [cur ? cur.title : balanser]);
+      }
 
       this.initialize = function () {
         scroll.body().addClass('torrent-list');
@@ -175,33 +195,40 @@
             if (a.stype == 'season') { choice.season = b.index; saveChoice(); Lampa.Select.close(); self.reset(); self.loading(true); buildNative(); }
           }
         };
+        setSortMenu();               // <-- меню источников доступно ВСЕГДА, даже при ошибке
         this.loading(true);
-        if (balanser == 'nextembed') {
-          getKpId(function (kp) { kpId = kp; tryNative(); });
-        } else {
-          loadProviders(function () {
-            var idx = balanser == 'vidi' ? 2 : 0;
-            if (providers[idx]) startIframe(providers[idx]);
-            else {
-              Lampa.Noty.show(Lampa.Lang.translate('kinogo_switch'));
-              balanser = 'nextembed';
-              Lampa.Storage.set('kinogo_balanser', balanser);
-              getKpId(function (kp) { kpId = kp; tryNative(); });
-            }
-          });
-        }
+        if (balanser == 'nextembed') nextembedPath();
+        else kinogoIframePath();
       };
 
-      // Плеер 1: сначала нативно (свой плеер Lampa), при неудаче — iframe
-      function tryNative() {
-        var embedUrl = providers[1] || (kpId ? 'https://api.nextembed.ws/embed/kp/' + kpId : '');
-        log('embed', embedUrl ? embedUrl.slice(0, 60) : 'no url');
-        if (!embedUrl) { self.empty(Lampa.Lang.translate('kinogo_nolink')); return; }
+      // Плеер 1: сначала ID из TMDB (работает даже в web), потом страница kinogo
+      function nextembedPath() {
+        getKpId(function (kp) {
+          if (kp) { tryNativeOrIframe(NEXTEMBED + '/embed/kp/' + kp); return; }
+          loadProviders(function () {
+            if (providers[1]) tryNativeOrIframe(providers[1]);
+            else self.empty(Lampa.Lang.translate('kinogo_noid'));
+          });
+        });
+      }
+
+      function tryNativeOrIframe(embedUrl) {
+        log('embed', embedUrl.slice(0, 60));
         getText(embedUrl, function (html) {
           var cfg = parseNextembed(html);
           if (cfg && srcUrl(cfg.source, cfg._key)) { config = cfg; buildNative(); }
           else startIframe(embedUrl);
-        }, function () { startIframe(embedUrl); });
+        }, function () {
+          startIframe(embedUrl);     // web: прямой запрос запрещён -> открываем рамку
+        });
+      }
+
+      function kinogoIframePath() {
+        loadProviders(function () {
+          var idx = balanser == 'vidi' ? 2 : 0;
+          if (providers[idx]) startIframe(providers[idx]);
+          else self.empty(Lampa.Lang.translate('kinogo_nolink'));
+        });
       }
 
       function buildNative() {
@@ -274,11 +301,6 @@
           });
           scroll.append(html);
         });
-        setFilter();
-        Lampa.Controller.enable('content');
-      }
-
-      function setFilter() {
         var select = [{ title: Lampa.Lang.translate('torrent_parser_reset'), reset: true }];
         if (filterData.season) {
           select.push({
@@ -287,14 +309,8 @@
           });
         }
         filter.set('filter', select);
-        filter.set('sort', BALANSERS.map(function (b) {
-          return { title: b.title, source: b.name, selected: b.name == balanser };
-        }));
-        var chosen = [];
-        if (filterData.season) chosen.push(Lampa.Lang.translate('torrent_serial_season') + ': ' + filterData.season[choice.season]);
-        filter.chosen('filter', chosen);
-        var cur = BALANSERS.filter(function (b) { return b.name == balanser; })[0];
-        filter.chosen('sort', [cur ? cur.title : balanser]);
+        setSortMenu();
+        Lampa.Controller.enable('content');
       }
 
       function startIframe(url) {
@@ -309,8 +325,7 @@
         var src = $('<div class="kinogo-frame-btn selector">' + Lampa.Lang.translate('settings_rest_source') + '</div>');
         src.on('hover:enter', function () {
           var order = ['nextembed', 'cinemar', 'vidi'];
-          var next = order[(order.indexOf(balanser) + 1) % order.length];
-          balanser = next;
+          balanser = order[(order.indexOf(balanser) + 1) % order.length];
           Lampa.Storage.set('kinogo_balanser', balanser);
           Lampa.Activity.replace();
         });
@@ -319,7 +334,7 @@
         box.append($('<iframe class="kinogo-frame" allowfullscreen allow="autoplay; encrypted-media; fullscreen; picture-in-picture"></iframe>').attr('src', url));
         wrap.append(bar).append(box);
         scroll.append(wrap);
-        setFilter();
+        setSortMenu();
         Lampa.Controller.enable('content');
       }
 
@@ -357,7 +372,6 @@
       type: 'video',
       name: 'Kinogo',
       description: Lampa.Lang.translate('kinogo_desc'),
-      icon: 'data:image/svg+xml;base64,' + window.btoa(ICON_SVG),
       component: 'kinogo_online',
       onContextMenu: function () { return { name: Lampa.Lang.translate('kinogo_title'), description: '' }; },
       onContextLauch: function (object) {
