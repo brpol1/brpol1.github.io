@@ -3,8 +3,8 @@
   if (window.kinogo_online_plugin) return;
   window.kinogo_online_plugin = true;
 
-  // Адрес воркера можно задать здесь ИЛИ в консоли Lampa:
-  //   Lampa.Storage.set('kinogo_proxy', 'https://kinogo-proxy.ИМЯ.workers.dev')
+  // Единственная настройка: адрес воркера, если когда-нибудь его поставим (шаг Б).
+  // Сейчас пусто — и всё работает без него.
   var PROXY = '';
   var PROXY_KEY = '';
   var KINOGO = 'https://kinogo.luxury';
@@ -28,7 +28,8 @@
       kinogo_title: { ru: 'Kinogo', en: 'Kinogo' },
       kinogo_desc:  { ru: 'Фильмы и сериалы с kinogo.luxury', en: 'Movies from kinogo.luxury' },
       kinogo_nolink:{ ru: 'Kinogo: не удалось получить видео', en: 'Kinogo: no video' },
-      kinogo_iframe:{ ru: 'Kinogo: прокси не задан — открываю окно источника', en: 'Kinogo: opening source window' }
+      kinogo_noid:  { ru: 'Kinogo: не нашёл, как открыть этот фильм (нет ID и страница сайта недоступна)', en: 'Kinogo: no player url' },
+      kinogo_window:{ ru: 'Kinogo: открываю окно источника', en: 'Kinogo: opening source window' }
     });
 
     Lampa.Template.add('kinogo_css',
@@ -69,7 +70,7 @@
       var scroll = new Lampa.Scroll({ mask: true, over: true });
       var files  = new Lampa.Explorer(object);
       var filter = new Lampa.Filter(object);
-      var providers = {}, config = null, filterData = {}, embedUrl = '';
+      var providers = {}, config = null, filterData = {}, ids = null;
       var trace = [], statusEl = null;
       var balanser = Lampa.Storage.get(BAL_KEY, 'nextembed');
       var choice = getChoice();
@@ -101,7 +102,6 @@
       }
       function showFail(msg) {
         var lines = trace.slice(-8);
-        if (!proxyBase()) lines.unshift('воркер не задан: прямые запросы из браузера режет CORS/Referer-защита');
         self.empty(esc(msg) + '<div class="kinogo-trace">' + lines.map(esc).join('<br>') + '</div>');
       }
       function safely(fn, arg) {
@@ -114,17 +114,11 @@
         p = String(p).replace(/\s+/g, '');
         return p ? p.replace(/\/+$/, '') + '/' : '';
       }
-      // поток/субтитры через воркер с Referer'ом плеера — иначе CDN даёт заглушку с рекламой
-      function streamUrl(u) {
-        var px = proxyBase();
-        if (!px || !u) return u;
-        return px + '?url=' + encodeURIComponent(u) +
-          '&ref=' + encodeURIComponent(NEXTEMBED + '/') +
-          (PROXY_KEY ? '&key=' + encodeURIComponent(PROXY_KEY) : '');
-      }
       function snippet(s) {
         return String(s).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
       }
+
+      // сеть: воркер (если задан) → напрямую
       function getText(url, check, ok, fail, ref) {
         var steps = [], px = proxyBase();
         var host = url.replace(/^https?:\/\/([^\/]+).*$/, '$1');
@@ -174,6 +168,29 @@
         step(0);
       }
 
+      // ID фильма: карточка → справочник TMDB (там есть коды Кинопоиска и IMDb)
+      function getIds(cb) {
+        if (ids) return cb(ids);
+        ids = { kp: object.movie.kinopoisk_id ? String(object.movie.kinopoisk_id) : '',
+                imdb: object.movie.imdb_id ? String(object.movie.imdb_id) : '' };
+        if (ids.kp || ids.imdb) { log('id: из карточки kp=' + (ids.kp || '-') + ' imdb=' + (ids.imdb || '-')); return cb(ids); }
+        try {
+          if (Lampa.Api && Lampa.Api.sources && Lampa.Api.sources.tmdb) {
+            var type = object.movie.name ? 'tv' : 'movie';
+            var id = (['cub', 'tmdb'].indexOf(object.movie.source || 'tmdb') == -1) ? object.movie.tmdb_id : object.movie.id;
+            Lampa.Api.sources.tmdb.get(type + '/' + id + '/external_ids', {}, function (json) {
+              ids.kp = json && json.kinopoisk_id ? String(json.kinopoisk_id) : '';
+              ids.imdb = json && json.imdb_id ? String(json.imdb_id) : '';
+              log('id: из TMDB kp=' + (ids.kp || '-') + ' imdb=' + (ids.imdb || '-'));
+              cb(ids);
+            }, function () { log('id: TMDB не ответил'); cb(ids); });
+            return;
+          }
+        } catch (e) {}
+        cb(ids);
+      }
+
+      // страница kinogo → адреса трёх плееров
       function loadProviders(cb) {
         if (providers[0] || providers[1]) return cb();
         function fromPage(html) {
@@ -196,7 +213,10 @@
           }, cb, KINOGO + '/');
       }
 
-      function extractConfig(code) {
+      function parseNextembed(html) {
+        var m = html.match(/<script data-name="mk">([\s\S]*?)<\/script>/);
+        if (!m) { log('nextembed: нет блока mk'); return null; }
+        var code = m[1], opts = null;
         var i = code.indexOf('makePlayer(');
         if (i >= 0) {
           var s = code.indexOf('{', i);
@@ -209,40 +229,38 @@
               else if (c === '{') depth++;
               else if (c === '}') { depth--; if (depth === 0) { e = k; break; } }
             }
-            if (e > 0) { try { return JSON.parse(code.slice(s, e + 1)); } catch (err) {} }
+            if (e > 0) { try { opts = JSON.parse(code.slice(s, e + 1)); } catch (err) {} }
           }
         }
-        var opts = null;
-        var shadow = ['window', 'document', 'Lampa', '$', 'jQuery', 'localStorage', 'sessionStorage',
-          'fetch', 'XMLHttpRequest', 'top', 'parent', 'self', 'globalThis', 'navigator', 'location'];
-        try {
-          var fn = Function.apply(null, shadow.concat(['makePlayer', 'adsConfig', '"use strict";\n' + code]));
-          fn.apply(undefined, shadow.map(function () { return undefined; })
-            .concat([function (o) { opts = o; }, {}]));
-        } catch (err2) {
-          log('nextembed: скрипт конфига не выполнился: ' + (err2 && err2.message));
-          return null;
+        if (!opts) {
+          var shadow = ['window', 'document', 'Lampa', '$', 'jQuery', 'localStorage', 'sessionStorage',
+            'fetch', 'XMLHttpRequest', 'top', 'parent', 'self', 'globalThis', 'navigator', 'location'];
+          try {
+            var fn = Function.apply(null, shadow.concat(['makePlayer', 'adsConfig', '"use strict";\n' + code]));
+            fn.apply(undefined, shadow.map(function () { return undefined; })
+              .concat([function (o) { opts = o; }, {}]));
+          } catch (err2) { log('nextembed: конфиг не разобрался: ' + (err2 && err2.message)); return null; }
         }
-        return opts;
-      }
-      function parseNextembed(html) {
-        var m = html.match(/<script data-name="mk">([\s\S]*?)<\/script>/);
-        if (!m) { log('nextembed: нет блока data-name="mk"'); return null; }
-        var opts = extractConfig(m[1]);
         if (!opts || !opts.source) { log('nextembed: в конфиге нет source'); return null; }
         opts._key = (html.match(/var lok\s*=\s*1\s*,\s*[a-f0-9]{8,}\s*=\s*"([a-f0-9]{6,12})"/) || [])[1] || '';
-        if (!opts._key) log('nextembed: ключ lok не найден — поток может не открыться');
+        if (!opts._key) log('nextembed: ключ lok не найден');
         return opts;
       }
       function withKey(u, key) { return (u && key) ? u + (u.indexOf('?') >= 0 ? '&' : '?') + key : u; }
       function srcUrl(src, key) { return withKey(src && (src.hls || src.dasha), key); }
-      function mapCC(cc) { return (cc || []).map(function (s) { return { label: s.name, url: s.url }; }); }
+      function streamUrl(u) {
+        var px = proxyBase();
+        if (!px || !u) return u;
+        return px + '?url=' + encodeURIComponent(u) + '&ref=' + encodeURIComponent(NEXTEMBED + '/') +
+               (PROXY_KEY ? '&key=' + encodeURIComponent(PROXY_KEY) : '');
+      }
+      function mapCC(cc) { return (cc || []).map(function (s) { return { label: s.name, url: streamUrl(s.url) }; }); }
 
       this.loading = function (state) {
         if (state) this.activity.loader(true);
         else { this.activity.loader(false); this.activity.toggle(); }
       };
-      this.reset = function () { statusEl = null; scroll.clear(); scroll.render().find('.kinogo-empty').remove(); };
+      this.reset = function () { statusEl = null; scroll.clear(); };
       this.empty = function (html) {
         this.loading(false);
         statusEl = null;
@@ -276,13 +294,14 @@
         else nextembedPath();
       };
 
-      // Плеер 1: без воркера — сразу окно источника (гарантия), с воркером — нативный разбор
+      // Плеер 1: находим адрес → без воркера открываем ОКНО источника (играет всегда),
+      // с воркером — пробуем родной плеер Lampa без рекламы.
       function nextembedPath() {
         function useEmbed(url) {
-          embedUrl = url;
+          if (!url) { showFail(Lampa.Lang.translate('kinogo_noid')); return; }
+          log('nextembed: адрес ' + url.slice(0, 60));
           if (!proxyBase()) {
-            log('nextembed: воркер не задан → окно источника');
-            Lampa.Noty.show(Lampa.Lang.translate('kinogo_iframe'));
+            Lampa.Noty.show(Lampa.Lang.translate('kinogo_window'));
             startIframe(url);
             return;
           }
@@ -296,11 +315,10 @@
             function () { startIframe(url); }, KINOGO + '/');
         }
         if (providers[1]) return useEmbed(providers[1]);
-        if (object.movie.kinopoisk_id) return useEmbed(NEXTEMBED + '/embed/kp/' + object.movie.kinopoisk_id);
-        if (object.movie.imdb_id) return useEmbed(NEXTEMBED + '/embed/imdb/' + object.movie.imdb_id);
-        loadProviders(function () {
-          if (providers[1]) useEmbed(providers[1]);
-          else showFail(Lampa.Lang.translate('kinogo_nolink'));
+        getIds(function (id) {
+          if (id.kp) return useEmbed(NEXTEMBED + '/embed/kp/' + id.kp);
+          if (id.imdb) return useEmbed(NEXTEMBED + '/embed/imdb/' + id.imdb);
+          loadProviders(function () { useEmbed(providers[1] || ''); });
         });
       }
 
@@ -358,10 +376,7 @@
         });
         var playlist = items.map(function (el) {
           return {
-            title: el.title,
-            url: streamUrl(el.url),
-            subtitles: (el.subtitles || []).map(function (s) { return { label: s.label, url: streamUrl(s.url) }; }),
-            isonline: true,
+            title: el.title, url: streamUrl(el.url), subtitles: el.subtitles, isonline: true,
             season: el.season, episode: el.episode,
             voice_name: el.voices && el.voices[0] ? el.voices[0] : '',
             timeline: el.timeline,
