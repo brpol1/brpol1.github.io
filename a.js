@@ -3,20 +3,37 @@
   if (window.kinogo_online_plugin) return;
   window.kinogo_online_plugin = true;
 
+  // ================= НАСТРОЙКИ =================
+  // Адрес вашего Cloudflare Worker (файл kinogo-proxy-worker.js), например:
+  //   'https://kinogo-proxy.ИМЯ.workers.dev'
+  // Можно не править файл, а выполнить в консоли Lampa (F12):
+  //   Lampa.Storage.set('kinogo_proxy', 'https://kinogo-proxy.ИМЯ.workers.dev')
+  var PROXY = '';
+  var PROXY_KEY = '';   // если в воркере задана переменная KEY — впишите то же значение
+  var KINOGO = 'https://kinogo.luxury';
+  var NEXTEMBED = 'https://api.nextembed.ws';
+  var ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#2bd49a"/><path d="M25 18l24 14-24 14z" fill="#071510"/></svg>';
+  // =============================================
+
   var BALANSERS = [
     { name: 'nextembed', title: 'Kinogo · Плеер 1' },
     { name: 'cinemar',   title: 'Kinogo · Смотреть онлайн' },
     { name: 'vidi',      title: 'Kinogo · Плеер 3' }
   ];
-  var KINOGO = 'https://kinogo.luxury';
-  var NEXTEMBED = 'https://api.nextembed.ws';
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
 
   function startPlugin() {
     Lampa.Lang.add({
       kinogo_title: { ru: 'Kinogo', en: 'Kinogo' },
       kinogo_desc:  { ru: 'Фильмы и сериалы с kinogo.luxury', en: 'Movies from kinogo.luxury' },
       kinogo_nolink:{ ru: 'Kinogo: не удалось получить видео', en: 'Kinogo: no video' },
-      kinogo_noid:  { ru: 'Kinogo: у фильма нет ID Кинопоиска в TMDB — в web-версии Плеер 1 недоступен. Откройте в приложении Android/ТВ или выберите другой источник.', en: 'Kinogo: no Kinopoisk ID for this title' },
+      kinogo_noid:  { ru: 'Kinogo: у фильма нет ID Кинопоиска в TMDB — в web-версии Плеер 1 недоступен. Откройте в приложении Android/ТВ, задайте прокси-воркер или выберите другой источник.', en: 'Kinogo: no Kinopoisk ID' },
+      kinogo_switch:{ ru: 'Kinogo: открываю запасной плеер', en: 'Kinogo: fallback' },
       kinogo_retry: { ru: 'Повторить', en: 'Retry' },
       kinogo_change:{ ru: 'Сменить источник', en: 'Change source' }
     });
@@ -40,7 +57,7 @@
       ".kinogo-empty__buttons{display:flex;margin-top:1.2em}" +
       ".kinogo-empty__button{background:rgba(0,0,0,.4);font-size:1em;padding:.6em 1.4em;border-radius:.4em;margin-right:1em}" +
       ".kinogo-empty__button.focus{background:#fff;color:#000}" +
-      ".kinogo-diag{margin-top:1.4em;font-size:.7em;opacity:.55;line-height:1.6;word-break:break-all}" +
+      ".kinogo-trace{margin-top:1.4em;font-size:.7em;opacity:.55;line-height:1.6;word-break:break-all}" +
       "</style>");
     $('body').append(Lampa.Template.get('kinogo_css', {}, true));
 
@@ -62,11 +79,11 @@
       var providers = {}, config = null, filterData = {}, kpId = null;
       var balanser = Lampa.Storage.get('kinogo_balanser', 'nextembed');
       var choice = getChoice();
-      var diag = [];
+      var trace = [];
 
-      function log(step, info) {
-        diag.push(step + ' → ' + info);
-        try { console.log('[kinogo] ' + step, info); } catch (e) {}
+      function log(msg) {
+        trace.push(msg);
+        try { console.log('[kinogo] ' + msg); } catch (e) {}
       }
       function getChoice() {
         var all = Lampa.Storage.cache('kinogo_choice', 3000, {});
@@ -79,33 +96,76 @@
         all[object.movie.id] = choice;
         Lampa.Storage.set('kinogo_choice', all);
       }
+      function proxyBase() {
+        var p = '';
+        try { p = Lampa.Storage.get('kinogo_proxy', '') || PROXY || ''; } catch (e) { p = PROXY || ''; }
+        p = String(p).replace(/\s+/g, '');
+        return p ? p.replace(/\/+$/, '') + '/' : '';
+      }
+      function snippet(s) {
+        return String(s).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+      }
 
-      // один прямой запрос, без мёртвых прокси
-      function getText(url, ok, fail) {
-        if (destroyed) return;
-        var net = new Lampa.Reguest();
-        net.timeout(10000);
-        net['native'](url, function (str) {
-          if (str && String(str).length > 100) ok(String(str));
-          else { log('fetch', 'empty ' + url.slice(0, 50)); if (fail) fail(); }
-        }, function (er) {
-          log('fetch', 'err ' + ((er && er.status) || 0) + ' ' + url.slice(0, 50));
-          if (fail) fail();
-        }, false, { dataType: 'text' });
+      // сеть: воркер (если задан) → напрямую; ответ проверяем функцией check
+      function getText(url, check, ok, fail, ref) {
+        var steps = [];
+        var px = proxyBase();
+        var host = url.replace(/^https?:\/\/([^\/]+).*$/, '$1');
+        if (px) steps.push({
+          name: 'воркер',
+          url: px + '?url=' + encodeURIComponent(url) +
+               (ref ? '&ref=' + encodeURIComponent(ref) : '') +
+               (PROXY_KEY ? '&key=' + encodeURIComponent(PROXY_KEY) : '')
+        });
+        steps.push({ name: 'напрямую', url: url });
+        function step(i) {
+          if (destroyed) return;
+          if (i >= steps.length) { log(host + ': все пути исчерпаны'); if (fail) fail(); return; }
+          var st = steps[i], done = false, timer, net;
+          function next(reason) {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            log(host + ' · ' + st.name + ': ' + reason);
+            step(i + 1);
+          }
+          timer = setTimeout(function () {
+            try { if (net && net.clear) net.clear(); } catch (e) {}
+            next('нет ответа за 10 с');
+          }, 10000);
+          try {
+            net = new Lampa.Reguest();
+            net.timeout(8000);
+            net['native'](st.url, function (str) {
+              if (done) return;
+              str = (str === undefined || str === null) ? '' : (typeof str === 'string' ? str : JSON.stringify(str));
+              if (check(str)) {
+                done = true; clearTimeout(timer);
+                log(host + ' · ' + st.name + ': ok (' + str.length + ' симв.)');
+                ok(str);
+              } else {
+                next('ответ не похож на нужный: «' + snippet(str) + '»');
+              }
+            }, function (er) {
+              next('ошибка ' + ((er && er.status) || 0));
+            }, false, { dataType: 'text' });
+          } catch (e) { next('исключение ' + (e && e.message)); }
+        }
+        step(0);
       }
 
       function getKpId(cb) {
         if (kpId !== null) return cb(kpId);
-        if (object.movie.kinopoisk_id) { kpId = String(object.movie.kinopoisk_id); log('kp_id', 'card ' + kpId); return cb(kpId); }
+        if (object.movie.kinopoisk_id) { kpId = String(object.movie.kinopoisk_id); log('kp_id: из карточки ' + kpId); return cb(kpId); }
         try {
           if (Lampa.Api && Lampa.Api.sources && Lampa.Api.sources.tmdb) {
             var type = object.movie.name ? 'tv' : 'movie';
             var id = (['cub', 'tmdb'].indexOf(object.movie.source || 'tmdb') == -1) ? object.movie.tmdb_id : object.movie.id;
             Lampa.Api.sources.tmdb.get(type + '/' + id + '/external_ids', {}, function (json) {
               kpId = json && json.kinopoisk_id ? String(json.kinopoisk_id) : '';
-              log('kp_id', kpId || 'none');
+              log('kp_id: ' + (kpId || 'в TMDB нет'));
               cb(kpId);
-            }, function () { kpId = ''; log('kp_id', 'tmdb fail'); cb(''); });
+            }, function () { kpId = ''; log('kp_id: TMDB не ответил'); cb(''); });
             return;
           }
         } catch (e) {}
@@ -117,62 +177,95 @@
         function fromPage(html) {
           var re = /<li data-provider="(\d)" data-src="([^"]+)"/g, m, n = 0;
           while ((m = re.exec(html))) { providers[m[1]] = m[2].replace(/&amp;/g, '&'); n++; }
-          log('providers', 'found ' + n);
+          log('kinogo: плееров найдено ' + n);
           cb();
         }
         var title = object.movie.title || object.movie.name || '';
         getText(KINOGO + '/index.php?do=search&subaction=search&story=' + encodeURIComponent(title),
+          function (h) { return /href="\/\d+[^"]*?\.html"/.test(h) || /href="https:\/\/kinogo\.luxury\/\d+[^"]*?\.html"/.test(h); },
           function (html) {
             var cut = html.split("id='dle-content'")[1] || html;
-            var m = cut.match(/href="\/(\d+[^"]*?\.html)"/);
-            log('search', m ? m[1] : 'no result');
-            if (!m) return cb();
-            getText(KINOGO + '/' + m[1], fromPage, cb);
-          }, cb);
+            var m = cut.match(/href="\/(\d+[^"]*?\.html)"/) || cut.match(/href="https:\/\/kinogo\.luxury\/(\d+[^"]*?\.html)"/);
+            if (!m) { log('kinogo: в результатах поиска нет ссылки'); return cb(); }
+            log('kinogo: страница фильма /' + m[1]);
+            getText(KINOGO + '/' + m[1],
+              function (h) { return /<li data-provider="\d" data-src="/.test(h); },
+              fromPage, cb, KINOGO + '/');
+          }, cb, KINOGO + '/');
       }
 
       function parseNextembed(html) {
         var m = html.match(/<script data-name="mk">([\s\S]*?)<\/script>/);
-        if (!m) { log('parse', 'no mk script'); return null; }
-        var opts = null;
-        try { new Function('makePlayer', 'adsConfig', m[1])(function (o) { opts = o; }, {}); }
-        catch (e) { log('parse', 'eval err'); return null; }
-        if (!opts || !opts.source) { log('parse', 'no source'); return null; }
+        if (!m) { log('nextembed: нет блока mk'); return null; }
+        var code = m[1], opts = null;
+        var i = code.indexOf('makePlayer(');
+        if (i >= 0) {
+          var s = code.indexOf('{', i);
+          if (s >= 0) {
+            var depth = 0, inStr = false, q = '', ex = false, e = -1, k, c;
+            for (k = s; k < code.length; k++) {
+              c = code.charAt(k);
+              if (inStr) { if (ex) ex = false; else if (c === '\\') ex = true; else if (c === q) inStr = false; }
+              else if (c === '"' || c === "'") { inStr = true; q = c; }
+              else if (c === '{') depth++;
+              else if (c === '}') { depth--; if (depth === 0) { e = k; break; } }
+            }
+            if (e > 0) { try { opts = JSON.parse(code.slice(s, e + 1)); } catch (err) { opts = null; } }
+          }
+        }
+        if (!opts) {
+          try {
+            new Function('makePlayer', 'adsConfig', code)(function (o) { opts = o; }, {});
+          } catch (err) { log('nextembed: конфиг не разобрался: ' + (err && err.message)); return null; }
+        }
+        if (!opts || !opts.source) { log('nextembed: в конфиге нет source'); return null; }
         opts._key = (html.match(/var lok\s*=\s*1\s*,\s*[a-f0-9]{8,}\s*=\s*"([a-f0-9]{6,12})"/) || [])[1] || '';
-        log('parse', 'ok key=' + (opts._key || 'none') + ' hls=' + (opts.source.hls ? 'yes' : 'no'));
+        log('nextembed: конфиг ok, ключ=' + (opts._key || 'НЕ НАЙДЕН') + ', hls=' + (opts.source.hls ? 'есть' : 'нет'));
         return opts;
       }
-      function withKey(u, key) { return u ? u + (u.indexOf('?') >= 0 ? '&' : '?') + key : u; }
+      function withKey(u, key) { return (u && key) ? u + (u.indexOf('?') >= 0 ? '&' : '?') + key : u; }
       function srcUrl(src, key) { return withKey(src && (src.hls || src.dasha), key); }
       function mapCC(cc) { return (cc || []).map(function (s) { return { label: s.name, url: s.url }; }); }
 
-      this.loading = function (status) {
-        if (status) this.activity.loader(true);
+      this.loading = function (state) {
+        if (state) this.activity.loader(true);
         else { this.activity.loader(false); this.activity.toggle(); }
       };
       this.reset = function () { scroll.clear(); };
 
       this.empty = function (msg) {
         this.loading(false);
-        scroll.clear();
-        var box = $('<div class="kinogo-empty">' + msg +
+        setSortMenu();
+        var lines = trace.slice(-8);
+        if (!proxyBase()) lines.unshift('воркер не задан: из браузера прямые запросы к сайтам режет CORS');
+        var box = $('<div class="kinogo-empty">' + esc(msg) +
           '<div class="kinogo-empty__buttons"></div>' +
-          '<div class="kinogo-diag">' + diag.join('<br>') + '</div></div>');
+          '<div class="kinogo-trace">' + lines.map(esc).join('<br>') + '</div></div>');
         var retry = $('<div class="kinogo-empty__button selector">' + Lampa.Lang.translate('kinogo_retry') + '</div>');
         retry.on('hover:enter', function () { Lampa.Activity.replace(); });
         var change = $('<div class="kinogo-empty__button selector">' + Lampa.Lang.translate('kinogo_change') + '</div>');
-        change.on('hover:enter', function () {
-          filter.render().find('.filter--sort').trigger('hover:enter');
-        });
+        change.on('hover:enter', function () { filter.render().find('.filter--sort').trigger('hover:enter'); });
         box.find('.kinogo-empty__buttons').append(retry).append(change);
+        scroll.clear();
         scroll.append(box);
         Lampa.Controller.enable('content');
       };
 
       function setSortMenu() {
+        var select = [{ title: Lampa.Lang.translate('torrent_parser_reset'), reset: true }];
+        if (filterData.season) {
+          select.push({
+            title: Lampa.Lang.translate('torrent_serial_season'), stype: 'season',
+            items: filterData.season.map(function (t, i) { return { title: t, index: i, selected: i == choice.season }; })
+          });
+        }
+        filter.set('filter', select);
         filter.set('sort', BALANSERS.map(function (b) {
           return { title: b.title, source: b.name, selected: b.name == balanser };
         }));
+        var chosen = [];
+        if (filterData.season) chosen.push(Lampa.Lang.translate('torrent_serial_season') + ': ' + filterData.season[choice.season]);
+        filter.chosen('filter', chosen);
         var cur = BALANSERS.filter(function (b) { return b.name == balanser; })[0];
         filter.chosen('sort', [cur ? cur.title : balanser]);
       }
@@ -195,13 +288,13 @@
             if (a.stype == 'season') { choice.season = b.index; saveChoice(); Lampa.Select.close(); self.reset(); self.loading(true); buildNative(); }
           }
         };
-        setSortMenu();               // <-- меню источников доступно ВСЕГДА, даже при ошибке
+        setSortMenu();
         this.loading(true);
         if (balanser == 'nextembed') nextembedPath();
         else kinogoIframePath();
       };
 
-      // Плеер 1: сначала ID из TMDB (работает даже в web), потом страница kinogo
+      // Плеер 1: kp_id (карточка/TMDB) → скачать конфиг нативно → иначе iframe того же адреса
       function nextembedPath() {
         getKpId(function (kp) {
           if (kp) { tryNativeOrIframe(NEXTEMBED + '/embed/kp/' + kp); return; }
@@ -211,16 +304,17 @@
           });
         });
       }
-
       function tryNativeOrIframe(embedUrl) {
-        log('embed', embedUrl.slice(0, 60));
-        getText(embedUrl, function (html) {
-          var cfg = parseNextembed(html);
-          if (cfg && srcUrl(cfg.source, cfg._key)) { config = cfg; buildNative(); }
-          else startIframe(embedUrl);
-        }, function () {
-          startIframe(embedUrl);     // web: прямой запрос запрещён -> открываем рамку
-        });
+        log('nextembed: пробую адрес ' + embedUrl.slice(0, 60));
+        getText(embedUrl,
+          function (h) { return /<script data-name="mk">/.test(h); },
+          function (html) {
+            var cfg = parseNextembed(html);
+            if (cfg && srcUrl(cfg.source, cfg._key)) { config = cfg; buildNative(); }
+            else startIframe(embedUrl);
+          },
+          function () { startIframe(embedUrl); },   // web: CORS → открываем рамку, она работает
+          KINOGO + '/');
       }
 
       function kinogoIframePath() {
@@ -256,7 +350,7 @@
             voices: (config.source.audio && config.source.audio.names) || []
           });
         }
-        log('build', 'items=' + items.length);
+        log('список готов: ' + items.length + ' пункт(ов)');
         draw(items);
       }
 
@@ -301,21 +395,13 @@
           });
           scroll.append(html);
         });
-        var select = [{ title: Lampa.Lang.translate('torrent_parser_reset'), reset: true }];
-        if (filterData.season) {
-          select.push({
-            title: Lampa.Lang.translate('torrent_serial_season'), stype: 'season',
-            items: filterData.season.map(function (t, i) { return { title: t, index: i, selected: i == choice.season }; })
-          });
-        }
-        filter.set('filter', select);
         setSortMenu();
         Lampa.Controller.enable('content');
       }
 
       function startIframe(url) {
         if (destroyed) return;
-        log('iframe', url.slice(0, 60));
+        log('открываю iframe: ' + url.slice(0, 60));
         self.loading(false);
         scroll.clear();
         var wrap = $('<div class="kinogo-frame-wrap"></div>');
@@ -372,6 +458,7 @@
       type: 'video',
       name: 'Kinogo',
       description: Lampa.Lang.translate('kinogo_desc'),
+      icon: 'data:image/svg+xml;base64,' + window.btoa(ICON_SVG),
       component: 'kinogo_online',
       onContextMenu: function () { return { name: Lampa.Lang.translate('kinogo_title'), description: '' }; },
       onContextLauch: function (object) {
