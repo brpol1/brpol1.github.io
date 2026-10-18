@@ -3,6 +3,8 @@
   if (window.kinogo_online_plugin) return;
   window.kinogo_online_plugin = true;
 
+  // Адрес воркера можно задать здесь ИЛИ в консоли Lampa:
+  //   Lampa.Storage.set('kinogo_proxy', 'https://kinogo-proxy.ИМЯ.workers.dev')
   var PROXY = '';
   var PROXY_KEY = '';
   var KINOGO = 'https://kinogo.luxury';
@@ -26,8 +28,7 @@
       kinogo_title: { ru: 'Kinogo', en: 'Kinogo' },
       kinogo_desc:  { ru: 'Фильмы и сериалы с kinogo.luxury', en: 'Movies from kinogo.luxury' },
       kinogo_nolink:{ ru: 'Kinogo: не удалось получить видео', en: 'Kinogo: no video' },
-      kinogo_noid:  { ru: 'Kinogo: не смог построить адрес плеера (нет ID Кинопоиска и IMDb, страница kinogo недоступна из этой среды)', en: 'Kinogo: no player url' },
-      kinogo_switch:{ ru: 'Kinogo: открываю запасной плеер', en: 'Kinogo: fallback' }
+      kinogo_iframe:{ ru: 'Kinogo: прокси не задан — открываю окно источника', en: 'Kinogo: opening source window' }
     });
 
     Lampa.Template.add('kinogo_css',
@@ -68,7 +69,7 @@
       var scroll = new Lampa.Scroll({ mask: true, over: true });
       var files  = new Lampa.Explorer(object);
       var filter = new Lampa.Filter(object);
-      var providers = {}, config = null, filterData = {};
+      var providers = {}, config = null, filterData = {}, embedUrl = '';
       var trace = [], statusEl = null;
       var balanser = Lampa.Storage.get(BAL_KEY, 'nextembed');
       var choice = getChoice();
@@ -100,6 +101,7 @@
       }
       function showFail(msg) {
         var lines = trace.slice(-8);
+        if (!proxyBase()) lines.unshift('воркер не задан: прямые запросы из браузера режет CORS/Referer-защита');
         self.empty(esc(msg) + '<div class="kinogo-trace">' + lines.map(esc).join('<br>') + '</div>');
       }
       function safely(fn, arg) {
@@ -112,8 +114,16 @@
         p = String(p).replace(/\s+/g, '');
         return p ? p.replace(/\/+$/, '') + '/' : '';
       }
+      // поток/субтитры через воркер с Referer'ом плеера — иначе CDN даёт заглушку с рекламой
+      function streamUrl(u) {
+        var px = proxyBase();
+        if (!px || !u) return u;
+        return px + '?url=' + encodeURIComponent(u) +
+          '&ref=' + encodeURIComponent(NEXTEMBED + '/') +
+          (PROXY_KEY ? '&key=' + encodeURIComponent(PROXY_KEY) : '');
+      }
       function snippet(s) {
-        return String(s).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+        return String(s).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
       }
       function getText(url, check, ok, fail, ref) {
         var steps = [], px = proxyBase();
@@ -147,8 +157,7 @@
               if (finished) return;
               str = (str === undefined || str === null) ? '' : (typeof str === 'string' ? str : JSON.stringify(str));
               if (check(str)) {
-                finished = true;
-                clearTimeout(timer);
+                finished = true; clearTimeout(timer);
                 log(host + ' · ' + st.name + ': ok (' + str.length + ' симв.)');
                 safely(ok, str);
               } else {
@@ -222,32 +231,12 @@
         var opts = extractConfig(m[1]);
         if (!opts || !opts.source) { log('nextembed: в конфиге нет source'); return null; }
         opts._key = (html.match(/var lok\s*=\s*1\s*,\s*[a-f0-9]{8,}\s*=\s*"([a-f0-9]{6,12})"/) || [])[1] || '';
-        if (!opts._key) log('nextembed: ключ lok не найден — ссылка может не открыться');
+        if (!opts._key) log('nextembed: ключ lok не найден — поток может не открыться');
         return opts;
       }
       function withKey(u, key) { return (u && key) ? u + (u.indexOf('?') >= 0 ? '&' : '?') + key : u; }
       function srcUrl(src, key) { return withKey(src && (src.hls || src.dasha), key); }
       function mapCC(cc) { return (cc || []).map(function (s) { return { label: s.name, url: s.url }; }); }
-
-      // ===== ГЛАВНОЕ ИЗМЕНЕНИЕ 1.4: мосты Кинопоиск-ID → IMDb-код → страница kinogo =====
-      function nextembedUrl(cb) {
-        if (object.movie.kinopoisk_id) return cb(NEXTEMBED + '/embed/kp/' + object.movie.kinopoisk_id, 'kp');
-        if (object.movie.imdb_id)      return cb(NEXTEMBED + '/embed/imdb/' + object.movie.imdb_id, 'imdb');
-        loadProviders(function () {
-          if (providers[1]) cb(providers[1], 'kinogo');
-          else cb('', 'none');
-        });
-      }
-      function loadNextembed(cb) {
-        if (config) return cb(config);
-        nextembedUrl(function (url, via) {
-          if (!url) return cb(null);
-          log('nextembed: адрес через ' + via + ': ' + url.slice(0, 60));
-          getText(url, function (h) { return /<script data-name="mk">/.test(h); },
-            function (html) { cb(parseNextembed(html), url); },
-            function () { cb(null, url); }, KINOGO + '/');
-        });
-      }
 
       this.loading = function (state) {
         if (state) this.activity.loader(true);
@@ -278,33 +267,48 @@
             Lampa.Activity.replace();
           } else if (type == 'filter') {
             if (a.reset) { choice.season = 0; saveChoice(); Lampa.Select.close(); Lampa.Activity.replace(); return; }
-            if (a.stype == 'season') { choice.season = b.index; saveChoice(); Lampa.Select.close(); self.reset(); self.loading(true); build(); }
+            if (a.stype == 'season') { choice.season = b.index; saveChoice(); Lampa.Select.close(); self.reset(); self.loading(true); buildNative(); }
           }
         };
         setFilter();
         this.loading(true);
-        if (balanser !== 'nextembed') startIframe();
-        else build();
+        if (balanser !== 'nextembed') kinogoIframePath();
+        else nextembedPath();
       };
 
-      function build() {
-        status('Kinogo: подбираю плеер…');
-        loadNextembed(function (cfg, url) {
-          if (destroyed) return;
-          config = cfg;
-          if (config && srcUrl(config.source, config._key)) { buildNative(); return; }
-          // конфиг не скачать (CORS/защита) → ОТКРЫВАЕМ ОКНО с тем же адресом: окну запреты не мешают
-          if (url) { startIframe(url); return; }
-          // адреса нет вообще → пробуем запасные окна через страницу kinogo
-          loadProviders(function () {
-            if (providers[0]) {
-              Lampa.Noty.show(Lampa.Lang.translate('kinogo_switch'));
-              balanser = 'cinemar';
-              startIframe();
-            } else {
-              showFail(Lampa.Lang.translate('kinogo_noid'));
-            }
-          });
+      // Плеер 1: без воркера — сразу окно источника (гарантия), с воркером — нативный разбор
+      function nextembedPath() {
+        function useEmbed(url) {
+          embedUrl = url;
+          if (!proxyBase()) {
+            log('nextembed: воркер не задан → окно источника');
+            Lampa.Noty.show(Lampa.Lang.translate('kinogo_iframe'));
+            startIframe(url);
+            return;
+          }
+          status('Kinogo: читаю конфиг плеера…');
+          getText(url, function (h) { return /<script data-name="mk">/.test(h); },
+            function (html) {
+              var cfg = parseNextembed(html);
+              if (cfg && srcUrl(cfg.source, cfg._key)) { config = cfg; buildNative(); }
+              else startIframe(url);
+            },
+            function () { startIframe(url); }, KINOGO + '/');
+        }
+        if (providers[1]) return useEmbed(providers[1]);
+        if (object.movie.kinopoisk_id) return useEmbed(NEXTEMBED + '/embed/kp/' + object.movie.kinopoisk_id);
+        if (object.movie.imdb_id) return useEmbed(NEXTEMBED + '/embed/imdb/' + object.movie.imdb_id);
+        loadProviders(function () {
+          if (providers[1]) useEmbed(providers[1]);
+          else showFail(Lampa.Lang.translate('kinogo_nolink'));
+        });
+      }
+
+      function kinogoIframePath() {
+        loadProviders(function () {
+          var idx = balanser == 'vidi' ? 2 : 0;
+          if (providers[idx]) startIframe(providers[idx]);
+          else showFail(Lampa.Lang.translate('kinogo_nolink'));
         });
       }
 
@@ -354,7 +358,10 @@
         });
         var playlist = items.map(function (el) {
           return {
-            title: el.title, url: el.url, subtitles: el.subtitles, isonline: true,
+            title: el.title,
+            url: streamUrl(el.url),
+            subtitles: (el.subtitles || []).map(function (s) { return { label: s.label, url: streamUrl(s.url) }; }),
+            isonline: true,
             season: el.season, episode: el.episode,
             voice_name: el.voices && el.voices[0] ? el.voices[0] : '',
             timeline: el.timeline,
@@ -402,37 +409,29 @@
       }
 
       function startIframe(url) {
-        function open(srcUrlValue) {
-          if (destroyed) return;
-          log('открываю окно плеера: ' + srcUrlValue.slice(0, 60));
-          self.loading(false);
-          statusEl = null;
-          scroll.clear();
-          var wrap = $('<div class="kinogo-frame-wrap"></div>');
-          var bar  = $('<div class="kinogo-frame-bar"></div>');
-          var back = $('<div class="kinogo-frame-btn selector">← ' + Lampa.Lang.translate('back') + '</div>');
-          back.on('hover:enter', function () { Lampa.Activity.backward(); });
-          var src = $('<div class="kinogo-frame-btn selector">' + Lampa.Lang.translate('settings_rest_source') + '</div>');
-          src.on('hover:enter', function () {
-            var order = ['nextembed', 'cinemar', 'vidi'];
-            balanser = order[(order.indexOf(balanser) + 1) % order.length];
-            Lampa.Storage.set(BAL_KEY, balanser);
-            Lampa.Activity.replace();
-          });
-          bar.append(back).append(src);
-          var box = $('<div class="kinogo-frame-box"></div>');
-          box.append($('<iframe class="kinogo-frame" allowfullscreen allow="autoplay; encrypted-media; fullscreen; picture-in-picture"></iframe>').attr('src', srcUrlValue));
-          wrap.append(bar).append(box);
-          scroll.append(wrap);
-          setFilter();
-          Lampa.Controller.enable('content');
-        }
-        if (url) return open(url);
-        loadProviders(function () {
-          var idx = balanser == 'vidi' ? 2 : 0;
-          if (providers[idx]) open(providers[idx]);
-          else showFail(Lampa.Lang.translate('kinogo_nolink'));
+        if (destroyed || !url) { showFail(Lampa.Lang.translate('kinogo_nolink')); return; }
+        log('открываю окно плеера: ' + url.slice(0, 60));
+        self.loading(false);
+        statusEl = null;
+        scroll.clear();
+        var wrap = $('<div class="kinogo-frame-wrap"></div>');
+        var bar  = $('<div class="kinogo-frame-bar"></div>');
+        var back = $('<div class="kinogo-frame-btn selector">← ' + Lampa.Lang.translate('back') + '</div>');
+        back.on('hover:enter', function () { Lampa.Activity.backward(); });
+        var src = $('<div class="kinogo-frame-btn selector">' + Lampa.Lang.translate('settings_rest_source') + '</div>');
+        src.on('hover:enter', function () {
+          var order = ['nextembed', 'cinemar', 'vidi'];
+          balanser = order[(order.indexOf(balanser) + 1) % order.length];
+          Lampa.Storage.set(BAL_KEY, balanser);
+          Lampa.Activity.replace();
         });
+        bar.append(back).append(src);
+        var box = $('<div class="kinogo-frame-box"></div>');
+        box.append($('<iframe class="kinogo-frame" allowfullscreen allow="autoplay; encrypted-media; fullscreen; picture-in-picture"></iframe>').attr('src', url));
+        wrap.append(bar).append(box);
+        scroll.append(wrap);
+        setFilter();
+        Lampa.Controller.enable('content');
       }
 
       this.create = function () { return this.render(); };
